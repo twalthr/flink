@@ -112,6 +112,10 @@ public final class UpdatingTopCityExample {
         // an exception is thrown in case of an error
         insertionResult.await();
 
+        env.from("PopulationUpdates").execute().print();
+
+        if (true) return;
+
         // read from table and aggregate the total population per city
         final Table currentPopulation =
                 env.sqlQuery(
