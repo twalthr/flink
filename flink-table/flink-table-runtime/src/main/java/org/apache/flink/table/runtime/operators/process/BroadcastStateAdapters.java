@@ -219,7 +219,7 @@ public final class BroadcastStateAdapters {
         return new TableRuntimeException(
                 String.format(
                         "Broadcast state entry '%s' is read-only while processing a table "
-                                + "with row or set semantics.",
+                                + "with row or set semantics or while notifying stateful sets.",
                         stateName));
     }
 

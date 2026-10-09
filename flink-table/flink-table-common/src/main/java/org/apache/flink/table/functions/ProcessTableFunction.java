@@ -422,6 +422,14 @@ import java.time.LocalDateTime;
  * change to a broadcast state entry has no effect on rows of the main table(s) that have been
  * processed before.
  *
+ * <p>Use {@link ArgumentTrait#NOTIFY_STATEFUL_SETS} to re-evaluate previously processed sets. For
+ * every broadcast row, the PTF is then additionally called once for every set that holds at least
+ * one state entry scoped to the set on the virtual processor. The same broadcast row is passed
+ * together with the set's key context. In this case, state entries of the set are accessible,
+ * broadcast state is read-only, and the PTF can emit results and register timers. Notifying
+ * stateful sets is expensive and should only be used if broadcast rows are rare and the overall key
+ * space is relatively low.
+ *
  * <pre>{@code
  * // Function that filters sentences using a dynamically updated list of bad words
  * class RuleFunction extends ProcessTableFunction<String> {

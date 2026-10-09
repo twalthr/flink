@@ -1474,6 +1474,86 @@ The following rules apply to broadcast tables and broadcast state:
 - It is the responsibility of the PTF implementer to maintain identical broadcast state across all virtual processors,
   i.e. broadcast state should only be updated deterministically based on the broadcast rows.
 
+#### Notifying Stateful Sets
+
+By default, a change to a broadcast state entry has no effect on sets that have been processed before. Especially when
+building a rule engine, the question arises how to re-evaluate previously processed sets with the new broadcast
+information. For this, a broadcast table can be declared with `ArgumentTrait.NOTIFY_STATEFUL_SETS`.
+
+For every row of such a broadcast table, `eval()` is called multiple times:
+
+1. First, without a key context as described above. This call updates the broadcast state (if available).
+2. Afterwards, once for every set that holds at least one state entry scoped to the set on the current virtual processor.
+   The same broadcast row is passed together with the set's key context.
+
+The following example deduplicates events per key. A row of the broadcast table resets the deduplication for all keys.
+
+{{< tabs "5ddc43b1-d719-4bb6-be26-4aed9476e5d3" >}}
+{{< tab "Java" >}}
+```java
+TableEnvironment env = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
+
+env.executeSql("CREATE VIEW Events(id, payload) AS VALUES (1, 'a'), (1, 'a'), (2, 'b')");
+env.executeSql("CREATE VIEW Resets(reason) AS VALUES ('cache invalidation')");
+
+env.createFunction("ControllableDedup", ControllableDedup.class);
+
+env
+  .executeSql("SELECT * FROM ControllableDedup(data => TABLE Events PARTITION BY id, resets => TABLE Resets)")
+  .print();
+
+// --------------------
+// Function declaration
+// --------------------
+
+// Function that deduplicates events per key until a reset is broadcast
+public static class ControllableDedup extends ProcessTableFunction<String> {
+
+  public void eval(
+      Context ctx,
+      @StateHint ValueView<String> seen,
+      @ArgumentHint(SET_SEMANTIC_TABLE) Row data,
+      @ArgumentHint({BROADCAST_SEMANTIC_TABLE, NOTIFY_STATEFUL_SETS}) Row resets
+  ) throws Exception {
+    // Process row from table 'Events': emit only the first payload per key
+    if (data != null) {
+      if (seen.getValue() == null) {
+        String payload = data.getFieldAs("payload");
+        seen.setValue(payload);
+        collect(payload);
+      }
+      return;
+    }
+
+    // Process row from table 'Resets': no key context, so state scoped to a set is null
+    if (resets != null && seen == null) {
+      return;
+    }
+
+    // Process row from table 'Resets': with key context, so act on notification
+    if (resets != null && seen != null) {
+      ctx.clearAllState();
+    }
+  }
+}
+```
+{{< /tab >}}
+{{< /tabs >}}
+
+The following rules apply to notifying stateful sets:
+
+- At least one state entry scoped to a set must be declared. Sets without state entries are not notified.
+- With key context, state entries of the set are accessible and broadcast state is read-only. Similar to processing a row
+  of the main table(s), the PTF can emit results via `collect()` and register timers. Results contain the partition key
+  of the set.
+
+{{< hint warning >}}
+Notifying stateful sets is expensive. For every broadcast row, all keys in state are loaded and a PTF's eval() is called for
+each of them. Processing of other rows and checkpointing is blocked until all sets have been notified. Thus, this trait
+should only be used if broadcast rows are rare compared to rows of the main table(s) and the overall key space is
+relatively low.
+{{< /hint >}}
+
 ### Efficiency and Design Principles
 
 A high number of input tables can negatively impact a single TaskManager or subtask. Network buffers must be allocated

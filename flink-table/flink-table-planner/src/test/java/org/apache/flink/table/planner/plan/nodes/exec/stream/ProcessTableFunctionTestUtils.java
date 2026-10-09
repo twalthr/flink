@@ -62,6 +62,7 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.table.annotation.ArgumentTrait.BROADCAST_SEMANTIC_TABLE;
+import static org.apache.flink.table.annotation.ArgumentTrait.NOTIFY_STATEFUL_SETS;
 import static org.apache.flink.table.annotation.ArgumentTrait.OPTIONAL_PARTITION_BY;
 import static org.apache.flink.table.annotation.ArgumentTrait.PASS_COLUMNS_THROUGH;
 import static org.apache.flink.table.annotation.ArgumentTrait.REQUIRE_FULL_DELETE;
@@ -219,6 +220,58 @@ public class ProcessTableFunctionTestUtils {
                             Row.of("Bob", 99, Instant.ofEpochMilli(1)),
                             Row.of("Alice", 42, Instant.ofEpochMilli(2)),
                             Row.of("Charly", 7, Instant.ofEpochMilli(3)))
+                    .build();
+
+    /** Main table for notifying stateful sets that is only available before restore. */
+    public static final SourceTestStep NOTIFY_RESTORE_SOURCE =
+            SourceTestStep.newBuilder("t")
+                    .addSchema(TIMED_SOURCE_SCHEMA)
+                    .producedBeforeRestore(
+                            Row.of("Bob", 1, Instant.ofEpochMilli(0)),
+                            Row.of("Alice", 2, Instant.ofEpochMilli(1)))
+                    .build();
+
+    /**
+     * Broadcast table for notifying stateful sets. The row before restore is a marker for {@link
+     * NotifyStatefulSetsFunction} such that its output doesn't depend on the order in which main
+     * and broadcast tables are processed.
+     */
+    public static final SourceTestStep NOTIFY_RESTORE_RESETS_SOURCE =
+            SourceTestStep.newBuilder("resets")
+                    .addSchema("name STRING", "ts TIMESTAMP_LTZ(3)", "WATERMARK FOR ts AS ts")
+                    .producedBeforeRestore(Row.of(null, Instant.ofEpochMilli(0)))
+                    .producedAfterRestore(
+                            Row.of("Alice", Instant.ofEpochMilli(2)),
+                            Row.of("Bob", Instant.ofEpochMilli(3)))
+                    .build();
+
+    /**
+     * Main table for {@link NotifyStatefulSetsRulesFunction}. The marker row before restore ensures
+     * output that doesn't depend on the order in which main and broadcast tables are processed.
+     */
+    public static final SourceTestStep NOTIFY_RULES_RESTORE_SOURCE =
+            SourceTestStep.newBuilder("t")
+                    .addSchema(TIMED_SOURCE_SCHEMA)
+                    .producedBeforeRestore(
+                            Row.of("Marker", -1, Instant.ofEpochMilli(0)),
+                            Row.of("Bob", 1, Instant.ofEpochMilli(0)),
+                            Row.of("Alice", 1, Instant.ofEpochMilli(1)))
+                    .producedAfterRestore(Row.of("Charly", 1, Instant.ofEpochMilli(1001)))
+                    .build();
+
+    /**
+     * Broadcast table for {@link NotifyStatefulSetsRulesFunction}. The rule after restore notifies
+     * the restored sets and advances the watermark beyond all timers.
+     */
+    public static final SourceTestStep NOTIFY_RULES_RESTORE_RULES_SOURCE =
+            SourceTestStep.newBuilder("rules")
+                    .addSchema(
+                            "name STRING",
+                            "weight INT",
+                            "ts TIMESTAMP_LTZ(3)",
+                            "WATERMARK FOR ts AS ts - INTERVAL '0.001' SECOND")
+                    .producedBeforeRestore(Row.of("Dave", 3, Instant.ofEpochMilli(2)))
+                    .producedAfterRestore(Row.of("Eve", 4, Instant.ofEpochMilli(1001)))
                     .build();
 
     /** Corresponds to {@link AppendProcessTableFunctionBase}. */
@@ -1478,6 +1531,133 @@ public class ProcessTableFunctionTestUtils {
             count.setValue(c);
             collectObjects(
                     input, c, weights.get(input.getFieldAs("name")), totalWeight.getValue(), stats);
+        }
+    }
+
+    /**
+     * Testing function that notifies all stateful sets about a reset. The set that matches the
+     * reset clears its state.
+     */
+    public static class NotifyStatefulSetsFunction extends AppendProcessTableFunctionBase {
+        @SuppressWarnings("unused")
+        public void eval(
+                Context ctx,
+                @StateHint SetStats stats,
+                @StateHint(StateKind.BROADCAST) ValueView<Integer> resets,
+                @ArgumentHint(SET_SEMANTIC_TABLE) Row input,
+                @ArgumentHint({BROADCAST_SEMANTIC_TABLE, NOTIFY_STATEFUL_SETS}) Row control)
+                throws Exception {
+            if (input != null) {
+                stats.name = input.getFieldAs("name");
+                stats.rows++;
+                collectObjects(input, stats.rows);
+                return;
+            }
+            final String resetName = control.getFieldAs("name");
+            if (resetName == null) {
+                // Marker row that is independent of the main table
+                return;
+            }
+            if (stats == null) {
+                // Without key context, write access to broadcast state
+                resets.setValue(Optional.ofNullable(resets.getValue()).orElse(0) + 1);
+                return;
+            }
+            // With key context, read access to broadcast state
+            collectObjects(resetName, stats, resets.getValue());
+            if (resetName.equals(stats.name)) {
+                ctx.clearAllState();
+            }
+        }
+    }
+
+    /**
+     * Testing function that applies every broadcast rule exactly once to every set. Depending on
+     * the order in which tables are processed, a rule is applied when a set is created or when an
+     * existing set is notified. Timers act as synchronization barriers as they only fire after all
+     * broadcast rows up to the timer's time have been processed.
+     */
+    public static class NotifyStatefulSetsRulesFunction extends AppendProcessTableFunctionBase {
+        @SuppressWarnings("unused")
+        public void eval(
+                Context ctx,
+                @StateHint ValueView<Integer> rows,
+                @StateHint MapView<String, Long> appliedRules,
+                @StateHint(StateKind.BROADCAST) MapView<String, Long> rules,
+                @ArgumentHint(SET_SEMANTIC_TABLE) Row input,
+                @ArgumentHint({BROADCAST_SEMANTIC_TABLE, NOTIFY_STATEFUL_SETS}) Row rule)
+                throws Exception {
+            final TimeContext<Long> timeCtx = ctx.timeContext(Long.class);
+            if (input != null) {
+                if (input.<Integer>getFieldAs("score") < 0) {
+                    // Marker row that is independent of the broadcast table
+                    collectObjects(input);
+                    return;
+                }
+                if (rows.getValue() == null) {
+                    // New set: catch up with all rules received so far
+                    for (Map.Entry<String, Long> r : rules.entries()) {
+                        appliedRules.put(r.getKey(), r.getValue());
+                    }
+                    timeCtx.registerOnTime("middle", 3L);
+                    // Exceeds all input timestamps, thus, only fires at the end of all tables
+                    timeCtx.registerOnTime("end", 1000L);
+                }
+                rows.setValue(Optional.ofNullable(rows.getValue()).orElse(0) + 1);
+                return;
+            }
+            final String name = rule.getFieldAs("name");
+            if (rows == null) {
+                // Without key context, write access to broadcast state
+                rules.put(name, timeCtx.time());
+                return;
+            }
+            // With key context, the broadcast state has been updated before
+            if (!timeCtx.time().equals(rules.get(name))) {
+                throw new IllegalStateException("Broadcast state has not been updated.");
+            }
+            if (appliedRules.contains(name)) {
+                throw new IllegalStateException("Rule has been applied before: " + name);
+            }
+            try {
+                rules.remove(name);
+                throw new IllegalStateException("Broadcast state should be read-only.");
+            } catch (TableRuntimeException e) {
+                // Expected
+            }
+            appliedRules.put(name, timeCtx.time());
+        }
+
+        public void onTimer(
+                OnTimerContext ctx,
+                ValueView<Integer> rows,
+                MapView<String, Long> appliedRules,
+                MapView<String, Long> rules)
+                throws Exception {
+            final long time = ctx.timeContext(Long.class).time();
+            if (ctx.currentTimer().equals("middle")) {
+                // Only rules up to the timer's time are guaranteed to be applied
+                final MapView<String, Long> passedRules = new MapView<>();
+                for (Map.Entry<String, Long> r : appliedRules.entries()) {
+                    if (r.getValue() <= time) {
+                        passedRules.put(r.getKey(), r.getValue());
+                    }
+                }
+                collectObjects(toSortedString(passedRules));
+            } else {
+                collectObjects(rows.getValue(), toSortedString(appliedRules));
+            }
+        }
+    }
+
+    /** POJO for state scoped to a set. */
+    public static class SetStats {
+        public String name;
+        public int rows;
+
+        @Override
+        public String toString() {
+            return String.format("SetStats(name=%s, rows=%s)", name, rows);
         }
     }
 

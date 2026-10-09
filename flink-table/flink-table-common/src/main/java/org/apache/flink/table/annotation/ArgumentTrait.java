@@ -93,8 +93,10 @@ public enum ArgumentTrait {
      * state entries. State entries that are scoped to a set are passed as null. The PTF must not
      * emit results via {@code collect()} or register/clear timers.
      *
-     * <p>A change to a broadcast state entry has no effect on rows of the main table(s) that have
-     * been processed before. Rows of different tables are not processed in a deterministic order.
+     * <p>By default, a change to a broadcast state entry has no effect on rows of the main table(s)
+     * that have been processed before. Rows of different tables are not processed in a
+     * deterministic order. Use {@link #NOTIFY_STATEFUL_SETS} to re-evaluate all stateful sets based
+     * on the broadcast information.
      *
      * <p>A signature may declare multiple broadcast table arguments, but must declare at least one
      * {@link #ROW_SEMANTIC_TABLE} or {@link #SET_SEMANTIC_TABLE} argument next to them.
@@ -108,6 +110,26 @@ public enum ArgumentTrait {
      * <p>Note: This trait is only valid for {@link #SET_SEMANTIC_TABLE} arguments.
      */
     OPTIONAL_PARTITION_BY(false, StaticArgumentTrait.OPTIONAL_PARTITION_BY),
+
+    /**
+     * Notifies all existing stateful sets to re-evaluate based on the given broadcast row and the
+     * potentially new state in state entries of kind {@link StateKind#BROADCAST}.
+     *
+     * <p>For every broadcast row, the PTF is called multiple times. First, without a key context to
+     * update broadcast state entries (if available). Afterwards, once for every set that holds at
+     * least one state entry of kind {@link StateKind#PER_SET} on the current virtual processor. In
+     * the latter case, the same broadcast row is passed together with the set's key context. The
+     * set's state entries are accessible, broadcast state entries are read-only, and the PTF can
+     * emit results and register timers similar to processing a row of the main table(s).
+     *
+     * <p>Note: Notifying stateful sets is expensive as it iterates over all keys in state. It might
+     * slow down processing and checkpointing. Thus, this trait should only be used if broadcast
+     * rows are rare compared to rows of the main table(s) and the overall key space is relatively
+     * low.
+     *
+     * <p>Note: This trait is only valid for {@link #BROADCAST_SEMANTIC_TABLE} arguments.
+     */
+    NOTIFY_STATEFUL_SETS(false, StaticArgumentTrait.NOTIFY_STATEFUL_SETS),
 
     /**
      * Defines that all columns of a table argument (i.e. {@link #ROW_SEMANTIC_TABLE} or {@link

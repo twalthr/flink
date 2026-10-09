@@ -905,6 +905,30 @@ class TypeInferenceExtractorTest {
                         .expectErrorMessage(
                                 "Invalid argument traits for argument 'rules'. "
                                         + "Trait BROADCAST_SEMANTIC_TABLE is incompatible with PASS_COLUMNS_THROUGH."),
+                // ---
+                TestSpec.forProcessTableFunction(NotifyStatefulSetsProcessTableFunction.class)
+                        .expectStaticArgument(
+                                StaticArgument.table(
+                                        "data",
+                                        Row.class,
+                                        false,
+                                        EnumSet.of(StaticArgumentTrait.SET_SEMANTIC_TABLE)))
+                        .expectStaticArgument(
+                                StaticArgument.table(
+                                        "rules",
+                                        Row.class,
+                                        false,
+                                        EnumSet.of(
+                                                StaticArgumentTrait.BROADCAST_SEMANTIC_TABLE,
+                                                StaticArgumentTrait.NOTIFY_STATEFUL_SETS)))
+                        .expectState("count", TypeStrategies.explicit(MyFirstState.TYPE))
+                        .expectOutput(TypeStrategies.explicit(DataTypes.INT())),
+                // ---
+                TestSpec.forProcessTableFunction(
+                                NotifyStatefulSetsWithoutBroadcastProcessTableFunction.class)
+                        .expectErrorMessage(
+                                "Invalid argument traits for argument 'data'. "
+                                        + "Trait NOTIFY_STATEFUL_SETS requires BROADCAST_SEMANTIC_TABLE."),
                 TestSpec.forScalarFunction("Bitmap in scalar function", BitmapTypeFunction.class)
                         .expectStaticArgument(
                                 StaticArgument.scalar("bm", DataTypes.BITMAP(), false))
@@ -2759,6 +2783,29 @@ class TypeInferenceExtractorTest {
         public void eval(
                 @StateHint(value = StateKind.BROADCAST, ttl = "1 day") MyFirstState rule,
                 @ArgumentHint(ArgumentTrait.SET_SEMANTIC_TABLE) Row data) {}
+    }
+
+    private static class NotifyStatefulSetsProcessTableFunction
+            extends ProcessTableFunction<Integer> {
+        public void eval(
+                @StateHint MyFirstState count,
+                @ArgumentHint(ArgumentTrait.SET_SEMANTIC_TABLE) Row data,
+                @ArgumentHint({
+                            ArgumentTrait.BROADCAST_SEMANTIC_TABLE,
+                            ArgumentTrait.NOTIFY_STATEFUL_SETS
+                        })
+                        Row rules) {}
+    }
+
+    private static class NotifyStatefulSetsWithoutBroadcastProcessTableFunction
+            extends ProcessTableFunction<Integer> {
+        public void eval(
+                @StateHint MyFirstState count,
+                @ArgumentHint({
+                            ArgumentTrait.SET_SEMANTIC_TABLE,
+                            ArgumentTrait.NOTIFY_STATEFUL_SETS
+                        })
+                        Row data) {}
     }
 
     private static class PassThroughBroadcastTableProcessTableFunction

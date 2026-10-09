@@ -280,14 +280,25 @@ public class SystemTypeInference {
     private static void checkBroadcastState(
             @Nullable List<StaticArgument> staticArgs,
             Map<String, StateTypeStrategy> stateTypeStrategies) {
+        final List<StaticArgument> args = staticArgs == null ? List.of() : staticArgs;
+        args.stream()
+                .filter(arg -> arg.is(StaticArgumentTrait.NOTIFY_STATEFUL_SETS))
+                .findFirst()
+                .filter(
+                        arg ->
+                                stateTypeStrategies.values().stream()
+                                        .allMatch(StateTypeStrategy::isBroadcast))
+                .ifPresent(
+                        arg -> {
+                            throw new ValidationException(
+                                    String.format(
+                                            "Table argument '%s' notifies stateful sets which "
+                                                    + "requires at least one state entry that is "
+                                                    + "scoped to a set.",
+                                            arg.getName()));
+                        });
         final boolean hasBroadcastTables =
-                staticArgs != null
-                        && staticArgs.stream()
-                                .anyMatch(
-                                        arg ->
-                                                arg.is(
-                                                        StaticArgumentTrait
-                                                                .BROADCAST_SEMANTIC_TABLE));
+                args.stream().anyMatch(arg -> arg.is(StaticArgumentTrait.BROADCAST_SEMANTIC_TABLE));
         if (hasBroadcastTables) {
             return;
         }

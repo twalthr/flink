@@ -33,6 +33,7 @@ import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.runtime.state.KeyedStateBackend;
 import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.VoidNamespaceSerializer;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperatorV2;
@@ -79,6 +80,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /** Base class for operators for {@link ProcessTableFunction}. */
 @Internal
@@ -100,6 +102,7 @@ public abstract class AbstractProcessTableOperator extends AbstractStreamOperato
     private transient PassAllCollector onTimerCollector;
     private transient StateDescriptor<?, ?>[] stateDescriptors;
     private transient StateHandle[] stateHandles;
+    private transient List<String> statefulSetStateNames;
 
     private transient @Nullable MapState<StringData, Long> namedTimersMapState;
     private transient @Nullable InternalTimerService<StringData> namedTimerService;
@@ -137,6 +140,7 @@ public abstract class AbstractProcessTableOperator extends AbstractStreamOperato
         setCollectors();
         setStateDescriptors();
         setStateHandles();
+        setStatefulSetStateNames();
 
         processTableRunner.initialize(
                 stateHandles,
@@ -180,6 +184,27 @@ public abstract class AbstractProcessTableOperator extends AbstractStreamOperato
 
     @Override
     public void onProcessingTime(InternalTimer<RowData, Object> timer) throws Exception {}
+
+    /**
+     * Calls the function for every set that holds at least one state entry on this virtual
+     * processor. The previously ingested broadcast row is passed together with the set's key
+     * context.
+     */
+    protected void notifyStatefulSets() throws Exception {
+        // Keys are materialized upfront because state backends don't support modifications of
+        // state while iterating over its keys
+        final KeyedStateBackend<RowData> keyedStateBackend = getKeyedStateBackend();
+        final List<RowData> keys;
+        try (Stream<RowData> keyStream =
+                keyedStateBackend.getKeys(statefulSetStateNames, VoidNamespace.INSTANCE)) {
+            keys = keyStream.collect(Collectors.toList());
+        }
+        for (RowData key : keys) {
+            setCurrentKey(key);
+            processTableRunner.ingestStatefulSetNotification(key);
+            processTableRunner.processEval();
+        }
+    }
 
     // --------------------------------------------------------------------------------------------
     // Context implementation
@@ -469,6 +494,14 @@ public abstract class AbstractProcessTableOperator extends AbstractStreamOperato
                             kind, stateInfo.isBroadcast(), stateHandle, hashFunction, equaliser);
         }
         this.stateHandles = stateHandles;
+    }
+
+    private void setStatefulSetStateNames() {
+        statefulSetStateNames =
+                stateInfos.stream()
+                        .filter(stateInfo -> !stateInfo.isBroadcast())
+                        .map(RuntimeStateInfo::getStateName)
+                        .collect(Collectors.toList());
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

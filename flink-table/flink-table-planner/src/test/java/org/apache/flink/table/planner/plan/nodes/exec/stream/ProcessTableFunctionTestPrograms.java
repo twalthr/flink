@@ -56,6 +56,8 @@ import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctio
 import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.MultiStateFunction;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NamedTimersFunction;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NonNullMapStateFunction;
+import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NotifyStatefulSetsFunction;
+import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NotifyStatefulSetsRulesFunction;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.OptionalOnTimeFunction;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.OptionalPartitionOnTimeFunction;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.OrderByFunction;
@@ -115,6 +117,10 @@ import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTable
 import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.MULTI_VALUES;
 import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.MULTI_VALUES_SOURCE;
 import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.MULTI_VALUES_SOURCE_SCHEMA;
+import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NOTIFY_RESTORE_RESETS_SOURCE;
+import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NOTIFY_RESTORE_SOURCE;
+import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NOTIFY_RULES_RESTORE_RULES_SOURCE;
+import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.NOTIFY_RULES_RESTORE_SOURCE;
 import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.PASS_THROUGH_BASE_SINK_SCHEMA;
 import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.TIMED_BASE_SINK_SCHEMA;
 import static org.apache.flink.table.planner.plan.nodes.exec.stream.ProcessTableFunctionTestUtils.TIMED_BROADCAST_RULES_SOURCE;
@@ -1852,6 +1858,78 @@ public class ProcessTableFunctionTestPrograms {
                             "INSERT INTO sink SELECT * FROM f(input => TABLE t PARTITION BY name, rule => TABLE rules)")
                     .build();
 
+    public static final TableTestProgram PROCESS_NOTIFY_STATEFUL_SETS =
+            TableTestProgram.of(
+                            "process-notify-stateful-sets",
+                            "broadcast rows are applied to new sets or notify existing sets")
+                    .setupTemporarySystemFunction("f", NotifyStatefulSetsRulesFunction.class)
+                    .setupTableSource(TIMED_SOURCE)
+                    .setupTableSource(TIMED_BROADCAST_RULES_SOURCE)
+                    .setupTableSink(
+                            SinkTestStep.newBuilder("sink")
+                                    .addSchema(KEYED_TIMED_BASE_SINK_SCHEMA)
+                                    .consumedValues(
+                                            "+I[Bob, {{Dave=2}}, 1970-01-01T00:00:00.003Z]",
+                                            "+I[Alice, {{Dave=2}}, 1970-01-01T00:00:00.003Z]",
+                                            "+I[Bob, {6, {Dave=2, Eve=5}}, 1970-01-01T00:00:01Z]",
+                                            "+I[Alice, {1, {Dave=2, Eve=5}}, 1970-01-01T00:00:01Z]")
+                                    .build())
+                    .runSql(
+                            "INSERT INTO sink SELECT * FROM f("
+                                    + "input => TABLE t PARTITION BY name, "
+                                    + "rule => TABLE rules, "
+                                    + "on_time => DESCRIPTOR(ts))")
+                    .build();
+
+    public static final TableTestProgram PROCESS_NOTIFY_STATEFUL_SETS_RULES_RESTORE =
+            TableTestProgram.of(
+                            "process-notify-stateful-sets-rules-restore",
+                            "broadcast rows are applied to new sets or notify restored sets")
+                    .setupTemporarySystemFunction("f", NotifyStatefulSetsRulesFunction.class)
+                    .setupTableSource(NOTIFY_RULES_RESTORE_SOURCE)
+                    .setupTableSource(NOTIFY_RULES_RESTORE_RULES_SOURCE)
+                    .setupTableSink(
+                            SinkTestStep.newBuilder("sink")
+                                    .addSchema(KEYED_TIMED_BASE_SINK_SCHEMA)
+                                    .consumedBeforeRestore(
+                                            "+I[Marker, {+I[Marker, -1, 1970-01-01T00:00:00Z]}, 1970-01-01T00:00:00Z]")
+                                    .consumedAfterRestore(
+                                            "+I[Bob, {{Dave=2}}, 1970-01-01T00:00:00.003Z]",
+                                            "+I[Alice, {{Dave=2}}, 1970-01-01T00:00:00.003Z]",
+                                            "+I[Charly, {{Dave=2}}, 1970-01-01T00:00:00.003Z]",
+                                            "+I[Bob, {1, {Dave=2, Eve=1001}}, 1970-01-01T00:00:01Z]",
+                                            "+I[Alice, {1, {Dave=2, Eve=1001}}, 1970-01-01T00:00:01Z]",
+                                            "+I[Charly, {1, {Dave=2, Eve=1001}}, 1970-01-01T00:00:01Z]")
+                                    .build())
+                    .runSql(
+                            "INSERT INTO sink SELECT * FROM f("
+                                    + "input => TABLE t PARTITION BY name, "
+                                    + "rule => TABLE rules, "
+                                    + "on_time => DESCRIPTOR(ts))")
+                    .build();
+
+    public static final TableTestProgram PROCESS_NOTIFY_STATEFUL_SETS_RESTORE =
+            TableTestProgram.of(
+                            "process-notify-stateful-sets-restore",
+                            "broadcast rows notify stateful sets that have been restored")
+                    .setupTemporarySystemFunction("f", NotifyStatefulSetsFunction.class)
+                    .setupTableSource(NOTIFY_RESTORE_SOURCE)
+                    .setupTableSource(NOTIFY_RESTORE_RESETS_SOURCE)
+                    .setupTableSink(
+                            SinkTestStep.newBuilder("sink")
+                                    .addSchema(KEYED_BASE_SINK_SCHEMA)
+                                    .consumedBeforeRestore(
+                                            "+I[Bob, {+I[Bob, 1, 1970-01-01T00:00:00Z], 1}]",
+                                            "+I[Alice, {+I[Alice, 2, 1970-01-01T00:00:00.001Z], 1}]")
+                                    .consumedAfterRestore(
+                                            "+I[Bob, {Alice, SetStats(name=Bob, rows=1), 1}]",
+                                            "+I[Alice, {Alice, SetStats(name=Alice, rows=1), 1}]",
+                                            "+I[Bob, {Bob, SetStats(name=Bob, rows=1), 2}]")
+                                    .build())
+                    .runSql(
+                            "INSERT INTO sink SELECT * FROM f(input => TABLE t PARTITION BY name, control => TABLE resets)")
+                    .build();
+
     public static final TableTestProgram PROCESS_INVALID_BROADCAST_COLLECT =
             TableTestProgram.of(
                             "process-invalid-broadcast-collect",
@@ -1890,7 +1968,7 @@ public class ProcessTableFunctionTestPrograms {
                             "SELECT * FROM f(input => TABLE t PARTITION BY name, rule => TABLE rules)",
                             TableRuntimeException.class,
                             "Broadcast state entry 'weights' is read-only while processing a table "
-                                    + "with row or set semantics.")
+                                    + "with row or set semantics or while notifying stateful sets.")
                     .build();
 
     public static final TableTestProgram PROCESS_MULTI_INPUT =

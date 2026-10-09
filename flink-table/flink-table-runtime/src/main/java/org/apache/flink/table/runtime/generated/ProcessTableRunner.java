@@ -100,6 +100,14 @@ public abstract class ProcessTableRunner extends AbstractRichFunction {
         ingestRow(pos, row, timeColumn, watermark);
     }
 
+    public void ingestStatefulSetNotification(RowData key) {
+        // The broadcast row has been ingested before, only the key context changes
+        evalCollector.setKeyPrefix(key);
+        if (emitRowtime && rowtime != null) {
+            evalCollector.setRowtime(rowtime);
+        }
+    }
+
     private void ingestRow(int pos, RowData row, int timeColumn, long watermark) {
         if (timeColumn == -1) {
             rowtime = null;
@@ -217,8 +225,8 @@ public abstract class ProcessTableRunner extends AbstractRichFunction {
             }
             if (stateHandle.kind == Kind.EAGER_VALUE) {
                 if (!processingBroadcast && stateHandle.broadcast) {
-                    // Broadcast state is read-only while processing other tables, thus,
-                    // modifications of eager value state are discarded
+                    // Broadcast state is read-only while processing other tables or notifying
+                    // stateful sets, thus, modifications of eager value state are discarded
                     continue;
                 }
                 moveValueStateFromFunction(stateHandle);
