@@ -20,179 +20,237 @@ package org.apache.flink.table.runtime.functions.ptf;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.dataview.ValueView;
-import org.apache.flink.table.catalog.DataTypeFactory;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.utils.ProjectedRowData;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
 import org.apache.flink.table.functions.FunctionContext;
-import org.apache.flink.table.functions.SpecializedFunction.SpecializedContext;
 import org.apache.flink.table.functions.TableSemantics;
+import org.apache.flink.table.functions.UserDefinedFunction;
+import org.apache.flink.table.runtime.functions.BuiltInSpecializedFunction;
 import org.apache.flink.table.runtime.typeutils.InternalSerializers;
+import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.inference.CallContext;
 import org.apache.flink.table.types.inference.StateTypeStrategy;
-import org.apache.flink.table.types.inference.TypeInference;
 import org.apache.flink.table.types.inference.strategies.ChangelogTypeStrategyUtils;
-import org.apache.flink.table.types.inference.strategies.DeduplicateKeepFirstTypeStrategy;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
-/** Implementation of the {@code DEDUPLICATE_KEEP_FIRST} process table function. */
+import static org.apache.flink.table.types.inference.strategies.DeduplicateKeepFirstTypeStrategy.ARG_INPUT;
+import static org.apache.flink.table.types.inference.strategies.DeduplicateKeepFirstTypeStrategy.ARG_STATE_TTL;
+
+/**
+ * Runtime implementation of {@link BuiltInFunctionDefinitions#DEDUPLICATE_KEEP_FIRST}.
+ *
+ * <p>Specializes into {@link ProcessingTime} or {@link EventTime} depending on whether the input
+ * has a time column, because the two modes require different state layouts.
+ */
 @Internal
-public class DeduplicateKeepFirst extends BuiltInProcessTableFunction<RowData> {
+public class DeduplicateKeepFirst extends BuiltInSpecializedFunction {
 
-    private static final long serialVersionUID = 1L;
-
-    private static final int CANDIDATE_PAYLOAD = 0;
-
-    private static final int CANDIDATE_EVENT_TIME = 1;
-
-    private final int[] outputIndices;
-
-    private final RowType inputRowType;
-
-    private final boolean isEventTime;
-
-    private transient ProjectedRowData projectedOutput;
-
-    private transient RowData.FieldGetter[] payloadGetters;
-
-    private transient TypeSerializer<Object>[] payloadSerializers;
-
-    public DeduplicateKeepFirst(final SpecializedContext context) {
-        super(BuiltInFunctionDefinitions.DEDUPLICATE_KEEP_FIRST, context);
-        final CallContext callContext = context.getCallContext();
-        final TableSemantics tableSemantics =
-                callContext
-                        .getTableSemantics(DeduplicateKeepFirstTypeStrategy.ARG_INPUT)
-                        .orElseThrow(() -> new IllegalStateException("Table argument expected."));
-        this.outputIndices = ChangelogTypeStrategyUtils.computeOutputIndices(tableSemantics);
-        this.inputRowType = (RowType) tableSemantics.dataType().getLogicalType();
-        this.isEventTime = tableSemantics.timeColumn() != -1;
+    public DeduplicateKeepFirst() {
+        super(BuiltInFunctionDefinitions.DEDUPLICATE_KEEP_FIRST);
     }
 
     @Override
-    public void open(final FunctionContext context) throws Exception {
-        super.open(context);
-        projectedOutput = ProjectedRowData.from(outputIndices);
-        payloadGetters = new RowData.FieldGetter[outputIndices.length];
-        payloadSerializers = new TypeSerializer[outputIndices.length];
-        for (int i = 0; i < outputIndices.length; i++) {
-            final LogicalType payloadType = inputRowType.getTypeAt(outputIndices[i]);
-            payloadGetters[i] = RowData.createFieldGetter(payloadType, outputIndices[i]);
-            payloadSerializers[i] = InternalSerializers.create(payloadType);
-        }
+    public UserDefinedFunction specialize(final SpecializedContext context) {
+        final TableSemantics semantics = tableSemantics(context.getCallContext());
+        return semantics.timeColumn() == -1 ? new ProcessingTime(context) : new EventTime(context);
     }
 
-    @Override
-    public TypeInference getTypeInference(final DataTypeFactory typeFactory) {
-        final TypeInference typeInference = super.getTypeInference(typeFactory);
-        if (isEventTime) {
-            return typeInference;
+    private static TableSemantics tableSemantics(final CallContext callContext) {
+        return callContext
+                .getTableSemantics(ARG_INPUT)
+                .orElseThrow(() -> new IllegalStateException("Table argument expected."));
+    }
+
+    private static StateTypeStrategy inferSeenState(final CallContext callContext) {
+        return StateTypeStrategy.of(
+                ctx -> Optional.of(ValueView.newValueViewDataType(DataTypes.BOOLEAN().notNull())),
+                callContext.getArgumentValue(ARG_STATE_TTL, Duration.class).orElse(null));
+    }
+
+    private static StateTypeStrategy inferCandidateState(final CallContext callContext) {
+        final TableSemantics semantics = tableSemantics(callContext);
+        final List<DataTypes.Field> inputFields = DataType.getFields(semantics.dataType());
+        final DataType payload =
+                DataTypes.ROW(
+                        Arrays.stream(ChangelogTypeStrategyUtils.computeOutputIndices(semantics))
+                                .mapToObj(inputFields::get)
+                                .toArray(DataTypes.Field[]::new));
+        final DataType candidate =
+                DataTypes.ROW(
+                        DataTypes.FIELD("payload", payload),
+                        DataTypes.FIELD("event_time", DataTypes.BIGINT()));
+        // The buffered candidate is cleared by its timer. Disable TTL so that a global
+        // table.exec.state.ttl cannot expire it before the timer fires.
+        return StateTypeStrategy.of(
+                ctx -> Optional.of(ValueView.newValueViewDataType(candidate)), Duration.ZERO);
+    }
+
+    private abstract static class Base extends BuiltInProcessTableFunction<RowData> {
+
+        private static final long serialVersionUID = 1L;
+
+        protected final int[] outputIndices;
+
+        protected final RowType inputRowType;
+
+        protected transient ProjectedRowData projectedOutput;
+
+        Base(
+                final SpecializedContext context,
+                final LinkedHashMap<String, StateTypeStrategy> state) {
+            super(BuiltInFunctionDefinitions.DEDUPLICATE_KEEP_FIRST, context, state);
+            final TableSemantics semantics = tableSemantics(context.getCallContext());
+            this.outputIndices = ChangelogTypeStrategyUtils.computeOutputIndices(semantics);
+            this.inputRowType = (RowType) semantics.dataType().getLogicalType();
         }
-        final LinkedHashMap<String, StateTypeStrategy> stateTypeStrategies =
-                new LinkedHashMap<>(typeInference.getStateTypeStrategies());
-        stateTypeStrategies.remove(DeduplicateKeepFirstTypeStrategy.CANDIDATE_STATE_NAME);
-        return TypeInference.newBuilder()
-                .staticArguments(
-                        typeInference.getStaticArguments().orElseThrow(IllegalStateException::new))
-                .inputTypeStrategy(typeInference.getInputTypeStrategy())
-                .stateTypeStrategies(stateTypeStrategies)
-                .outputTypeStrategy(typeInference.getOutputTypeStrategy())
-                .disableSystemArguments(typeInference.disableSystemArguments())
-                .build();
+
+        @Override
+        public void open(final FunctionContext context) throws Exception {
+            super.open(context);
+            projectedOutput = ProjectedRowData.from(outputIndices);
+        }
     }
 
     /** Watermarkless mode: emits the first arriving row per key. */
-    public void eval(
-            final Context ctx,
-            final ValueView<Boolean> seen,
-            final RowData input,
-            @Nullable final Long stateTtl,
-            @Nullable final Boolean resetTtlOnDuplicate)
-            throws Exception {
-        // state_ttl and reset_ttl_on_duplicate are applied at plan time via getTimeToLive(); the
-        // PTF codegen still requires a parameter for every declared argument, so it is unused here.
-        final RowKind kind = input.getRowKind();
-        if (kind == RowKind.UPDATE_BEFORE || kind == RowKind.DELETE) {
-            return;
+    @Internal
+    public static class ProcessingTime extends Base {
+
+        private static final long serialVersionUID = 1L;
+
+        public ProcessingTime(final SpecializedContext context) {
+            super(
+                    context,
+                    internalState(Map.entry("seen", inferSeenState(context.getCallContext()))));
         }
 
-        if (seen.getValue() == null) {
-            projectedOutput.replaceRow(input);
-            projectedOutput.setRowKind(RowKind.INSERT);
-            collect(projectedOutput);
-            seen.setValue(true);
-        } else if (resetTtlOnDuplicate == null || resetTtlOnDuplicate) {
-            seen.setValue(true);
+        public void eval(
+                final Context ctx,
+                final ValueView<Boolean> seen,
+                final RowData input,
+                @Nullable final Long stateTtl,
+                @Nullable final Boolean resetTtlOnDuplicate)
+                throws Exception {
+            // state_ttl and reset_ttl_on_duplicate are applied at plan time via the state TTL; the
+            // PTF codegen still requires a parameter for every declared argument.
+            final RowKind kind = input.getRowKind();
+            if (kind == RowKind.UPDATE_BEFORE || kind == RowKind.DELETE) {
+                return;
+            }
+
+            if (seen.getValue() == null) {
+                projectedOutput.replaceRow(input);
+                projectedOutput.setRowKind(RowKind.INSERT);
+                collect(projectedOutput);
+                seen.setValue(true);
+            } else if (resetTtlOnDuplicate == null || resetTtlOnDuplicate) {
+                seen.setValue(true);
+            }
         }
     }
 
     /** Event-time mode: emits the row with the earliest event time per key. */
-    public void eval(
-            final Context ctx,
-            final ValueView<Boolean> seen,
-            final ValueView<RowData> candidate,
-            final RowData input,
-            @Nullable final Long stateTtl,
-            @Nullable final Boolean resetTtlOnDuplicate)
-            throws Exception {
-        final TimeContext<Long> context = ctx.timeContext(Long.class);
-        final Long rowtime = context.time();
-        final Long watermark = context.tableWatermark();
-        if (watermark != null && rowtime <= watermark) {
-            return;
+    @Internal
+    public static class EventTime extends Base {
+
+        private static final long serialVersionUID = 1L;
+
+        private static final int CANDIDATE_PAYLOAD = 0;
+
+        private static final int CANDIDATE_EVENT_TIME = 1;
+
+        private transient RowData.FieldGetter[] payloadGetters;
+
+        private transient TypeSerializer<Object>[] payloadSerializers;
+
+        public EventTime(final SpecializedContext context) {
+            super(
+                    context,
+                    internalState(
+                            Map.entry("seen", inferSeenState(context.getCallContext())),
+                            Map.entry("candidate", inferCandidateState(context.getCallContext()))));
         }
 
-        if (seen.getValue() == null) { // not yet emitted → buffer the earliest candidate
-            final RowData currLowest = candidate.getValue();
-            final Long currentLowestEventTime =
-                    currLowest == null ? null : currLowest.getLong(CANDIDATE_EVENT_TIME);
-            if (currentLowestEventTime == null || rowtime < currentLowestEventTime) {
-                if (currentLowestEventTime != null) {
-                    context.clearTimer(currentLowestEventTime);
-                }
-                // object reuse may overwrite the input's memory before the timer fires
-                candidate.setValue(materializeCandidate(input, rowtime));
-                context.registerOnTime(rowtime);
+        @Override
+        @SuppressWarnings("unchecked")
+        public void open(final FunctionContext context) throws Exception {
+            super.open(context);
+            payloadGetters = new RowData.FieldGetter[outputIndices.length];
+            payloadSerializers = new TypeSerializer[outputIndices.length];
+            for (int i = 0; i < outputIndices.length; i++) {
+                final LogicalType payloadType = inputRowType.getTypeAt(outputIndices[i]);
+                payloadGetters[i] = RowData.createFieldGetter(payloadType, outputIndices[i]);
+                payloadSerializers[i] = InternalSerializers.create(payloadType);
             }
-        } else if (resetTtlOnDuplicate == null || resetTtlOnDuplicate) {
+        }
+
+        public void eval(
+                final Context ctx,
+                final ValueView<Boolean> seen,
+                final ValueView<RowData> candidate,
+                final RowData input,
+                @Nullable final Long stateTtl,
+                @Nullable final Boolean resetTtlOnDuplicate)
+                throws Exception {
+            final TimeContext<Long> context = ctx.timeContext(Long.class);
+            final Long rowtime = context.time();
+            final Long watermark = context.tableWatermark();
+            if (watermark != null && rowtime <= watermark) {
+                return;
+            }
+
+            if (seen.getValue() == null) { // not yet emitted → buffer the earliest candidate
+                final RowData currLowest = candidate.getValue();
+                final Long currentLowestEventTime =
+                        currLowest == null ? null : currLowest.getLong(CANDIDATE_EVENT_TIME);
+                if (currentLowestEventTime == null || rowtime < currentLowestEventTime) {
+                    if (currentLowestEventTime != null) {
+                        context.clearTimer(currentLowestEventTime);
+                    }
+                    // object reuse may overwrite the input's memory before the timer fires
+                    candidate.setValue(materializeCandidate(input, rowtime));
+                    context.registerOnTime(rowtime);
+                }
+            } else if (resetTtlOnDuplicate == null || resetTtlOnDuplicate) {
+                seen.setValue(true);
+            }
+        }
+
+        public void onTimer(
+                final OnTimerContext ctx,
+                final ValueView<Boolean> seen,
+                final ValueView<RowData> candidate)
+                throws Exception {
+            final RowData currLowest = candidate.getValue();
+            if (currLowest == null) {
+                return;
+            }
+            collect(currLowest.getRow(CANDIDATE_PAYLOAD, outputIndices.length));
+            candidate.clear();
             seen.setValue(true);
         }
-    }
 
-    /**
-     * Never called: watermarkless mode registers no timers, but codegen requires an {@code onTimer}
-     * matching the state layout once any {@code onTimer} is declared.
-     */
-    public void onTimer(final OnTimerContext ctx, final ValueView<Boolean> seen) {}
-
-    public void onTimer(
-            final OnTimerContext ctx,
-            final ValueView<Boolean> seen,
-            final ValueView<RowData> candidate)
-            throws Exception {
-        final RowData currLowest = candidate.getValue();
-        if (currLowest == null) {
-            return;
+        private GenericRowData materializeCandidate(final RowData input, final long rowtime) {
+            final GenericRowData payload = new GenericRowData(outputIndices.length);
+            for (int i = 0; i < outputIndices.length; i++) {
+                final Object field = payloadGetters[i].getFieldOrNull(input);
+                payload.setField(i, field == null ? null : payloadSerializers[i].copy(field));
+            }
+            return GenericRowData.of(payload, rowtime);
         }
-        collect(currLowest.getRow(CANDIDATE_PAYLOAD, outputIndices.length));
-        candidate.clear();
-        seen.setValue(true);
-    }
-
-    private GenericRowData materializeCandidate(final RowData input, final long rowtime) {
-        final GenericRowData payload = new GenericRowData(outputIndices.length);
-        for (int i = 0; i < outputIndices.length; i++) {
-            final Object field = payloadGetters[i].getFieldOrNull(input);
-            payload.setField(i, field == null ? null : payloadSerializers[i].copy(field));
-        }
-        return GenericRowData.of(payload, rowtime);
     }
 }
