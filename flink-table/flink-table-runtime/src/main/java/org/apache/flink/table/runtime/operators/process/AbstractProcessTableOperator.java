@@ -362,7 +362,10 @@ public abstract class AbstractProcessTableOperator extends AbstractStreamOperato
         if (shouldEnableTimers()) {
             internalTimeContext =
                     new WritableInternalTimeContext(
-                            namedTimersMapState, namedTimerService, unnamedTimerService);
+                            getKeyedStateBackend(),
+                            namedTimersMapState,
+                            namedTimerService,
+                            unnamedTimerService);
         } else {
             internalTimeContext = new ReadableInternalTimeContext();
         }
