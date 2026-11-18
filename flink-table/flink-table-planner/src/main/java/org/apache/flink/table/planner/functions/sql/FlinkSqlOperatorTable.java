@@ -1290,4 +1290,29 @@ public class FlinkSqlOperatorTable extends ReflectiveSqlOperatorTable {
                     .operandTypeChecker(OperandTypes.NILADIC)
                     .notDeterministic()
                     .build();
+
+    // --------------------------------------------------------------------------------------------
+    // VERSIONED OPERATORS
+    // --------------------------------------------------------------------------------------------
+
+    // Older versions of operators that are only used for restoring compiled plans.
+
+    public static final BuiltInSqlOperator ITEM_V1 =
+            BuiltInSqlOperator.newBuilder(SqlStdOperatorTable.ITEM).version(1).build();
+
+    // Latest versions of operators that Calcite references directly. They define the version
+    // that the compiled plan serializes for the operators that the planner actually uses. They
+    // are private to not register them in this table, the planner uses the wrapped operator.
+
+    private static final BuiltInSqlOperator ITEM_V2 =
+            BuiltInSqlOperator.newBuilder(SqlStdOperatorTable.ITEM).version(2).build();
+
+    /**
+     * Maps operators to their versioned representation in a compiled plan. The latest version maps
+     * from the operator used during planning, older versions map to themselves.
+     */
+    public static final Map<SqlOperator, BuiltInSqlOperator> VERSIONED_OPERATORS =
+            Map.of(
+                    ITEM, ITEM_V2,
+                    ITEM_V1, ITEM_V1);
 }

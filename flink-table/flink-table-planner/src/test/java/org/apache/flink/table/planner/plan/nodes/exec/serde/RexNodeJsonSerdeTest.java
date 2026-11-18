@@ -101,6 +101,7 @@ import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTest
 import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTestUtil.assertThatJsonDoesNotContain;
 import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTestUtil.testJsonRoundTrip;
 import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTestUtil.toJson;
+import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTestUtil.toObject;
 import static org.apache.flink.table.planner.plan.nodes.exec.serde.RexNodeJsonSerializer.FIELD_NAME_CLASS;
 import static org.apache.flink.table.utils.CatalogManagerMocks.DEFAULT_CATALOG;
 import static org.apache.flink.table.utils.CatalogManagerMocks.DEFAULT_DATABASE;
@@ -314,6 +315,37 @@ public class RexNodeJsonSerdeTest {
         // Registered temporary function
         registerTemporaryFunction(serdeContext);
         callable.call();
+    }
+
+    @Test
+    void testVersionedOperator() throws IOException {
+        final SerdeContext serdeContext = JsonSerdeTestUtil.configuredSerdeContext();
+        final RexBuilder rexBuilder = serdeContext.getRexBuilder();
+        final RexNode array =
+                rexBuilder.makeInputRef(
+                        FACTORY.createArrayType(FACTORY.createSqlType(SqlTypeName.INTEGER), -1), 0);
+        final RexNode index = rexBuilder.makeExactLiteral(BigDecimal.ONE);
+
+        // The operator used during planning is compiled as the latest version
+        final RexNode latestCall = rexBuilder.makeCall(FlinkSqlOperatorTable.ITEM, array, index);
+        final String latestJson = toJson(serdeContext, latestCall);
+        assertThat(latestJson).contains("\"$ITEM$2\"");
+        assertThat(toObject(serdeContext, latestJson, RexNode.class)).isEqualTo(latestCall);
+
+        // An older version is restored as such
+        final RexNode v1Call = rexBuilder.makeCall(FlinkSqlOperatorTable.ITEM_V1, array, index);
+        final String v1Json = toJson(serdeContext, v1Call);
+        assertThat(v1Json).contains("\"$ITEM$1\"");
+        final RexNode restoredV1Call = toObject(serdeContext, v1Json, RexNode.class);
+        assertThat(restoredV1Call).isEqualTo(v1Call);
+        assertThat(((RexCall) restoredV1Call).getOperator())
+                .isSameAs(FlinkSqlOperatorTable.ITEM_V1);
+
+        // Only older versions are registered next to the operator used during planning
+        assertThat(FlinkSqlOperatorTable.instance(false).getOperatorList())
+                .contains(FlinkSqlOperatorTable.ITEM_V1)
+                .filteredOn(op -> op.getName().equals("ITEM"))
+                .containsExactly(FlinkSqlOperatorTable.ITEM);
     }
 
     @Test

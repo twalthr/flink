@@ -1145,7 +1145,9 @@ class ExprCodeGenerator(
       case MAP_VALUE_CONSTRUCTOR =>
         generateMap(ctx, resultType, operands)
 
-      case ITEM =>
+      // ITEM is serialized as ITEM_V2 in a compiled plan, ITEM_V1 is restored from older plans.
+      // Both versions behave the same for now.
+      case ITEM | ITEM_V1 =>
         operands.head.resultType.getTypeRoot match {
           case LogicalTypeRoot.ARRAY =>
             val array = operands.head

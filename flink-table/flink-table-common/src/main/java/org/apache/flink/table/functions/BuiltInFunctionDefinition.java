@@ -207,7 +207,7 @@ public final class BuiltInFunctionDefinition implements SpecializedFunction {
     }
 
     // --------------------------------------------------------------------------------------------
-    // Shared with BuiltInSqlOperator and BuiltInSqlFunction in planner
+    // Shared with VersionedSqlOperator and BuiltInSqlFunction in planner
     // --------------------------------------------------------------------------------------------
 
     // note that for SQL operators the name can contain spaces and dollar signs

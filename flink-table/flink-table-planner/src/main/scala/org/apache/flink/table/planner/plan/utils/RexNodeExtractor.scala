@@ -536,7 +536,7 @@ class RexNodeToExpressionConverter(
           Option(
             CallExpression
               .permanent(TRY_CAST, Seq(operands.head, typeLiteral(outputType)).asJava, outputType))
-        case FlinkSqlOperatorTable.ITEM =>
+        case FlinkSqlOperatorTable.ITEM | FlinkSqlOperatorTable.ITEM_V1 =>
           operands.head.getOutputDataType.getLogicalType.getTypeRoot match {
             case ARRAY | MAP | VARIANT =>
               Option(CallExpression.permanent(AT, operands.asJava, outputType))
